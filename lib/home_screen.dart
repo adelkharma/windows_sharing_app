@@ -4,8 +4,41 @@ import 'discovery_service.dart';
 import 'chat_service.dart';
 import 'chat_screen.dart';
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    // Listen to changes in ChatService to navigate when a connection is established (e.g., when receiving a request and accepting it)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final chatService = context.read<ChatService>();
+      chatService.addListener(_onChatServiceChanged);
+    });
+  }
+
+  void _onChatServiceChanged() {
+    final chatService = context.read<ChatService>();
+    if (chatService.connectedPeer != null && ModalRoute.of(context)?.isCurrent == true) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => const ChatScreen()),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    // Only remove the listener if we are actually disposing the HomeScreen (which shouldn't happen often as it's the root)
+    // However, for completeness:
+    // context.read<ChatService>().removeListener(_onChatServiceChanged); // This might fail if provider is already disposed
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -64,16 +97,12 @@ class HomeScreen extends StatelessWidget {
                         onPressed: chatService.connectedPeer != null ? null : () async {
                           // Show loading indicator or handle connect
                           bool success = await chatService.connectTo(peer);
-                          if (success && context.mounted) {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(builder: (context) => const ChatScreen()),
-                            );
-                          } else if (context.mounted) {
+                          if (!success && context.mounted) {
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(content: Text('Connection failed or rejected')),
                             );
                           }
+                          // Navigation is handled by the listener in initState
                         },
                         child: const Text('Connect'),
                       ),

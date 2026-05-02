@@ -1,5 +1,8 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:open_filex/open_filex.dart';
 import 'chat_service.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -14,7 +17,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) {
+          context.read<ChatService>().disconnect();
+        }
+      },
+      child: Scaffold(
       appBar: AppBar(
         title: Consumer<ChatService>(
           builder: (context, chatService, child) {
@@ -53,12 +63,39 @@ class _ChatScreenState extends State<ChatScreen> {
                           color: msg.isMine ? Colors.blue : Colors.grey[300],
                           borderRadius: BorderRadius.circular(16),
                         ),
-                        child: Text(
-                          msg.text,
-                          style: TextStyle(
-                            color: msg.isMine ? Colors.white : Colors.black,
-                          ),
-                        ),
+                        child: msg.isFile
+                            ? InkWell(
+                                onTap: () {
+                                  if (msg.filePath != null) {
+                                    OpenFilex.open(msg.filePath!);
+                                  }
+                                },
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.insert_drive_file,
+                                      color: msg.isMine ? Colors.white : Colors.black,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Flexible(
+                                      child: Text(
+                                        msg.fileName ?? 'Unknown file',
+                                        style: TextStyle(
+                                          color: msg.isMine ? Colors.white : Colors.black,
+                                          decoration: TextDecoration.underline,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              )
+                            : Text(
+                                msg.text,
+                                style: TextStyle(
+                                  color: msg.isMine ? Colors.white : Colors.black,
+                                ),
+                              ),
                       ),
                     );
                   },
@@ -84,6 +121,19 @@ class _ChatScreenState extends State<ChatScreen> {
             padding: const EdgeInsets.all(8.0),
             child: Row(
               children: [
+                IconButton(
+                  icon: const Icon(Icons.attach_file),
+                  onPressed: () async {
+                    FilePickerResult? result = await FilePicker.pickFiles();
+                    if (result != null && result.files.single.path != null) {
+                      File file = File(result.files.single.path!);
+                      String fileName = result.files.single.name;
+                      if (context.mounted) {
+                        context.read<ChatService>().sendFile(file, fileName);
+                      }
+                    }
+                  },
+                ),
                 Expanded(
                   child: TextField(
                     controller: _textController,
@@ -112,7 +162,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
-    );
+    ));
   }
 
   @override

@@ -7,6 +7,7 @@ import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:uuid/uuid.dart';
+import 'package:path_provider/path_provider.dart';
 import 'models.dart';
 
 class ConnectionRequest {
@@ -136,15 +137,39 @@ class ChatService extends ChangeNotifier {
   void _setupChannel(WebSocketChannel channel) {
     _channel = channel;
     _channel?.stream.listen(
-      (message) {
+      (message) async {
         try {
           final data = jsonDecode(message);
           if (data['type'] == 'chat') {
+            final isFile = data['isFile'] == true;
+            String? savedFilePath;
+
+            if (isFile) {
+              final fileName = data['fileName'];
+              final fileData = data['fileData']; // Base64
+
+              if (fileName != null && fileData != null) {
+                try {
+                  final dir = await getApplicationDocumentsDirectory();
+                  final timestamp = DateTime.now().millisecondsSinceEpoch;
+                  final uniqueFileName = '${timestamp}_$fileName';
+                  final file = File('${dir.path}/$uniqueFileName');
+                  await file.writeAsBytes(base64Decode(fileData));
+                  savedFilePath = file.path;
+                } catch (e) {
+                  debugPrint('Error saving file: $e');
+                }
+              }
+            }
+
             final chatMsg = ChatMessage(
               id: data['id'],
               text: data['text'],
               isMine: false,
               timestamp: DateTime.parse(data['timestamp']),
+              isFile: isFile,
+              fileName: data['fileName'],
+              filePath: savedFilePath,
             );
             _messages.add(chatMsg);
             notifyListeners();
@@ -184,9 +209,46 @@ class ChatService extends ChangeNotifier {
       'id': chatMsg.id,
       'text': chatMsg.text,
       'timestamp': chatMsg.timestamp.toIso8601String(),
+      'isFile': false,
     });
 
     _channel?.sink.add(payload);
+  }
+
+  Future<void> sendFile(File file, String fileName) async {
+    if (_channel == null) return;
+
+    try {
+      final bytes = await file.readAsBytes();
+      final base64Data = base64Encode(bytes);
+
+      final chatMsg = ChatMessage(
+        id: const Uuid().v4(),
+        text: 'Sent a file: $fileName',
+        isMine: true,
+        timestamp: DateTime.now(),
+        isFile: true,
+        fileName: fileName,
+        filePath: file.path,
+      );
+
+      _messages.add(chatMsg);
+      notifyListeners();
+
+      final payload = jsonEncode({
+        'type': 'chat',
+        'id': chatMsg.id,
+        'text': chatMsg.text,
+        'timestamp': chatMsg.timestamp.toIso8601String(),
+        'isFile': true,
+        'fileName': fileName,
+        'fileData': base64Data,
+      });
+
+      _channel?.sink.add(payload);
+    } catch (e) {
+      debugPrint('Error sending file: $e');
+    }
   }
 
   void setTyping(bool isTyping) {

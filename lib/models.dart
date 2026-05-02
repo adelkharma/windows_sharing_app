@@ -25,11 +25,17 @@ class ChatMessage {
   final String text;
   final bool isMine;
   final DateTime timestamp;
+  final bool isFile;
+  final String? fileName;
+  final String? filePath;
 
   ChatMessage({
     required this.id,
     required this.text,
     required this.isMine,
     required this.timestamp,
+    this.isFile = false,
+    this.fileName,
+    this.filePath,
   });
 }
