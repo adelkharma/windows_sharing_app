@@ -8,6 +8,7 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:uuid/uuid.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 import 'models.dart';
 
 class ConnectionRequest {
@@ -42,10 +43,24 @@ class ChatService extends ChangeNotifier {
   bool _peerIsTyping = false;
   bool get peerIsTyping => _peerIsTyping;
 
+  // Track active file transfers
+  final Map<String, FileAttachment> _activeTransfers = {};
+  final Map<String, IOSink> _activeSinks = {};
+  final Map<String, String> _activeFilePaths = {};
+
+  bool _isChatFocused = true;
+
   ChatService({
     required this.localPeerId,
     required this.localPeerName,
   });
+
+  void setChatFocus(bool focused) {
+    _isChatFocused = focused;
+    if (focused && _channel != null) {
+      _sendReadReceipts();
+    }
+  }
 
   Future<void> startServer() async {
     var handler = const Pipeline().addHandler(_router);
@@ -84,7 +99,6 @@ class ChatService extends ChangeNotifier {
       return Response.forbidden('Already connected');
     }
 
-    // Await user approval
     var completer = ErrorBridgeCompleter<bool>();
 
     _incomingRequest = ConnectionRequest(
@@ -121,7 +135,6 @@ class ChatService extends ChangeNotifier {
       final uri = Uri.parse('ws://${peer.ip}:${peer.port}/connect?id=$localPeerId&name=${Uri.encodeComponent(localPeerName)}');
       final channel = WebSocketChannel.connect(uri);
 
-      // Wait a bit to see if connection is established or rejected
       await channel.ready;
 
       _connectedPeer = peer;
@@ -140,42 +153,25 @@ class ChatService extends ChangeNotifier {
       (message) async {
         try {
           final data = jsonDecode(message);
-          if (data['type'] == 'chat') {
-            final isFile = data['isFile'] == true;
-            String? savedFilePath;
+          final type = data['type'];
 
-            if (isFile) {
-              final fileName = data['fileName'];
-              final fileData = data['fileData']; // Base64
-
-              if (fileName != null && fileData != null) {
-                try {
-                  final dir = await getApplicationDocumentsDirectory();
-                  final timestamp = DateTime.now().millisecondsSinceEpoch;
-                  final uniqueFileName = '${timestamp}_$fileName';
-                  final file = File('${dir.path}/$uniqueFileName');
-                  await file.writeAsBytes(base64Decode(fileData));
-                  savedFilePath = file.path;
-                } catch (e) {
-                  debugPrint('Error saving file: $e');
-                }
-              }
-            }
-
-            final chatMsg = ChatMessage(
-              id: data['id'],
-              text: data['text'],
-              isMine: false,
-              timestamp: DateTime.parse(data['timestamp']),
-              isFile: isFile,
-              fileName: data['fileName'],
-              filePath: savedFilePath,
-            );
-            _messages.add(chatMsg);
-            notifyListeners();
-          } else if (data['type'] == 'typing') {
+          if (type == 'chat') {
+            _handleChatData(data);
+          } else if (type == 'file_meta') {
+            _handleFileMeta(data);
+          } else if (type == 'file_chunk') {
+            _handleFileChunk(data);
+          } else if (type == 'typing') {
             _peerIsTyping = data['isTyping'];
             notifyListeners();
+          } else if (type == 'edit') {
+            _handleEdit(data['id'], data['text']);
+          } else if (type == 'delete') {
+            _handleDelete(data['id']);
+          } else if (type == 'ack') {
+            _updateMessageStatus(data['id'], MessageStatus.delivered);
+          } else if (type == 'read') {
+            _updateMessageStatus(data['id'], MessageStatus.read);
           }
         } catch (e) {
           debugPrint('Error parsing message: $e');
@@ -191,77 +187,228 @@ class ChatService extends ChangeNotifier {
     );
   }
 
-  void sendMessage(String text) {
-    if (_channel == null || text.trim().isEmpty) return;
+  void _handleChatData(Map<String, dynamic> data) {
+    final msgId = data['id'];
+    List<FileAttachment> attachments = [];
+
+    if (data['files'] != null) {
+      for (var f in data['files']) {
+        final attach = FileAttachment(
+          id: f['id'],
+          fileName: f['name'],
+          totalBytes: f['size'],
+        );
+        attachments.add(attach);
+        _activeTransfers[attach.id] = attach;
+      }
+    }
 
     final chatMsg = ChatMessage(
-      id: const Uuid().v4(),
-      text: text,
-      isMine: true,
-      timestamp: DateTime.now(),
+      id: msgId,
+      text: data['text'] ?? '',
+      isMine: false,
+      timestamp: DateTime.parse(data['timestamp']),
+      status: _isChatFocused ? MessageStatus.read : MessageStatus.delivered,
+      files: attachments,
     );
 
     _messages.add(chatMsg);
     notifyListeners();
 
-    final payload = jsonEncode({
-      'type': 'chat',
-      'id': chatMsg.id,
-      'text': chatMsg.text,
-      'timestamp': chatMsg.timestamp.toIso8601String(),
-      'isFile': false,
-    });
+    // Send Ack
+    _channel?.sink.add(jsonEncode({'type': 'ack', 'id': msgId}));
 
-    _channel?.sink.add(payload);
+    if (_isChatFocused) {
+      _channel?.sink.add(jsonEncode({'type': 'read', 'id': msgId}));
+    }
   }
 
-  Future<void> sendFile(File file, String fileName) async {
+  Future<void> _handleFileMeta(Map<String, dynamic> data) async {
+    final fileId = data['fileId'];
+    final fileName = data['fileName'];
+
+    final dir = await getApplicationDocumentsDirectory();
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final path = p.join(dir.path, '${timestamp}_$fileName');
+
+    final file = File(path);
+    _activeSinks[fileId] = file.openWrite();
+    _activeFilePaths[fileId] = path;
+  }
+
+  void _handleFileChunk(Map<String, dynamic> data) {
+    final fileId = data['fileId'];
+    final chunkBase64 = data['chunk'];
+    final bytes = base64Decode(chunkBase64);
+    final transferred = data['transferred'];
+    final total = data['total'];
+
+    final sink = _activeSinks[fileId];
+    sink?.add(bytes);
+
+    final attach = _activeTransfers[fileId];
+    if (attach != null) {
+      // Basic speed calc could go here, omitting for brevity
+      attach.updateProgress(transferred, 0.0);
+
+      if (transferred >= total) {
+        sink?.close();
+        _activeSinks.remove(fileId);
+        final path = _activeFilePaths.remove(fileId);
+        if (path != null) {
+          attach.complete(path);
+        }
+        _activeTransfers.remove(fileId);
+      }
+    }
+  }
+
+  void _handleEdit(String id, String text) {
+    final msg = _messages.cast<ChatMessage?>().firstWhere((m) => m?.id == id, orElse: () => null);
+    if (msg != null) {
+      msg.edit(text);
+    }
+  }
+
+  void _handleDelete(String id) {
+    final msg = _messages.cast<ChatMessage?>().firstWhere((m) => m?.id == id, orElse: () => null);
+    if (msg != null) {
+      msg.delete();
+    }
+  }
+
+  void _updateMessageStatus(String id, MessageStatus status) {
+    final msg = _messages.cast<ChatMessage?>().firstWhere((m) => m?.id == id, orElse: () => null);
+    if (msg != null) {
+      msg.updateStatus(status);
+    }
+  }
+
+  void _sendReadReceipts() {
+    for (var msg in _messages.where((m) => !m.isMine && m.status != MessageStatus.read)) {
+      msg.updateStatus(MessageStatus.read);
+      _channel?.sink.add(jsonEncode({'type': 'read', 'id': msg.id}));
+    }
+  }
+
+  Future<void> sendFiles(List<File> files, {String text = ''}) async {
     if (_channel == null) return;
 
-    try {
-      final bytes = await file.readAsBytes();
-      final base64Data = base64Encode(bytes);
+    final msgId = const Uuid().v4();
+    List<FileAttachment> attachments = [];
+    List<Map<String, dynamic>> filesMeta = [];
 
-      final chatMsg = ChatMessage(
-        id: const Uuid().v4(),
-        text: 'Sent a file: $fileName',
-        isMine: true,
-        timestamp: DateTime.now(),
-        isFile: true,
-        fileName: fileName,
+    for (var file in files) {
+      final fileId = const Uuid().v4();
+      final length = await file.length();
+      final name = p.basename(file.path);
+
+      final attach = FileAttachment(
+        id: fileId,
+        fileName: name,
+        totalBytes: length,
         filePath: file.path,
+        transferredBytes: length,
+        isComplete: true,
       );
+      attachments.add(attach);
 
-      _messages.add(chatMsg);
-      notifyListeners();
-
-      final payload = jsonEncode({
-        'type': 'chat',
-        'id': chatMsg.id,
-        'text': chatMsg.text,
-        'timestamp': chatMsg.timestamp.toIso8601String(),
-        'isFile': true,
-        'fileName': fileName,
-        'fileData': base64Data,
+      filesMeta.add({
+        'id': fileId,
+        'name': name,
+        'size': length,
       });
-
-      _channel?.sink.add(payload);
-    } catch (e) {
-      debugPrint('Error sending file: $e');
     }
+
+    final chatMsg = ChatMessage(
+      id: msgId,
+      text: text,
+      isMine: true,
+      timestamp: DateTime.now(),
+      status: MessageStatus.sent,
+      files: attachments,
+    );
+
+    _messages.add(chatMsg);
+    notifyListeners();
+
+    // 1. Send the chat message frame
+    final payload = jsonEncode({
+      'type': 'chat',
+      'id': msgId,
+      'text': text,
+      'timestamp': chatMsg.timestamp.toIso8601String(),
+      'files': filesMeta.isNotEmpty ? filesMeta : null,
+    });
+    _channel?.sink.add(payload);
+
+    // 2. Send file data in chunks
+    for (var i = 0; i < files.length; i++) {
+      await _sendFileChunks(files[i], filesMeta[i]['id'], attachments[i]);
+    }
+  }
+
+  Future<void> _sendFileChunks(File file, String fileId, FileAttachment attachment) async {
+    final length = attachment.totalBytes;
+
+    _channel?.sink.add(jsonEncode({
+      'type': 'file_meta',
+      'fileId': fileId,
+      'fileName': attachment.fileName,
+      'total': length,
+    }));
+
+    final stream = file.openRead();
+    int transferred = 0;
+
+    await for (var chunk in stream) {
+      transferred += chunk.length;
+      final base64Chunk = base64Encode(chunk);
+
+      _channel?.sink.add(jsonEncode({
+        'type': 'file_chunk',
+        'fileId': fileId,
+        'chunk': base64Chunk,
+        'transferred': transferred,
+        'total': length,
+      }));
+
+      // Let the event loop breathe
+      await Future.delayed(Duration.zero);
+    }
+  }
+
+  void sendMessage(String text) {
+    if (_channel == null || text.trim().isEmpty) return;
+    sendFiles([], text: text);
+  }
+
+  void editMessage(String id, String newText) {
+    if (_channel == null) return;
+    _handleEdit(id, newText);
+    _channel?.sink.add(jsonEncode({
+      'type': 'edit',
+      'id': id,
+      'text': newText,
+    }));
+  }
+
+  void deleteMessage(String id) {
+    if (_channel == null) return;
+    _handleDelete(id);
+    _channel?.sink.add(jsonEncode({
+      'type': 'delete',
+      'id': id,
+    }));
   }
 
   void setTyping(bool isTyping) {
     if (_isTyping == isTyping || _channel == null) return;
-
     _isTyping = isTyping;
-
-    final payload = jsonEncode({
+    _channel?.sink.add(jsonEncode({
       'type': 'typing',
       'isTyping': isTyping,
-    });
-
-    _channel?.sink.add(payload);
+    }));
   }
 
   void disconnect() {
@@ -272,6 +419,12 @@ class ChatService extends ChangeNotifier {
     _incomingRequest = null;
     _peerIsTyping = false;
     _isTyping = false;
+    for (var sink in _activeSinks.values) {
+      sink.close();
+    }
+    _activeSinks.clear();
+    _activeTransfers.clear();
+    _activeFilePaths.clear();
     notifyListeners();
   }
 
